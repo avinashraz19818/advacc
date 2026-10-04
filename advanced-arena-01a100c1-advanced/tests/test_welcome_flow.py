@@ -32,6 +32,28 @@ class FakeContext:
         self.bot = bot
 
 
+class FakeJoinRequest:
+    def __init__(self, requester, chat):
+        self.from_user = requester
+        self.chat = chat
+        self.approved = False
+
+    async def approve(self):
+        self.approved = True
+
+
+class FakeUpdate:
+    def __init__(self, join_request):
+        self.chat_join_request = join_request
+
+
+class FakeRequester:
+    id = 55
+    first_name = "User"
+    last_name = None
+    username = None
+
+
 class TestWelcomeFlowViaUserAccount(unittest.TestCase):
     def setUp(self):
         self._old_ua = advanced.user_account
@@ -53,17 +75,18 @@ class TestWelcomeFlowViaUserAccount(unittest.TestCase):
         advanced.db.add_message(b1, -1001, "Ye video dekho", "FILEID1", "video")
         msgs = advanced.db.get_messages(-1001, b1)
 
-        asyncio.run(advanced._send_messages_with_media_groups(
+        sent = asyncio.run(advanced._send_messages_with_media_groups(
             55, msgs, self.context, bot_id=b1,
             attach_start_button=True, placeholder_user=None))
 
+        self.assertTrue(sent)
         # Text message user account se gayi
         self.assertEqual(self.fake_ua.calls[0][0], "send_text")
         self.assertIn("Welcome User!", self.fake_ua.calls[0][2])
         # Media bhi user account se gayi (bot se download + re-upload hoga)
         self.assertEqual(self.fake_ua.calls[1][0], "send_media")
         self.assertEqual(self.fake_ua.calls[1][2], "FILEID1")
-        # Bot se koi user-facing message NAHI gaya (sirf fallback hota)
+        # Bot se koi user-facing message NAHI gaya; fallback intentionally disabled.
         user_facing = [c for c in self.bot.calls if c[0].startswith("send_")]
         self.assertEqual(user_facing, [], "bot se message nahi jana chahiye")
 
@@ -74,24 +97,61 @@ class TestWelcomeFlowViaUserAccount(unittest.TestCase):
         advanced.db.add_message(b1, -1001, "Album pic 2", "M2", "photo", media_group_id="g1")
         msgs = advanced.db.get_messages(-1001, b1)
 
-        asyncio.run(advanced._send_messages_with_media_groups(
+        sent = asyncio.run(advanced._send_messages_with_media_groups(
             55, msgs, self.context, bot_id=b1, attach_start_button=True))
 
+        self.assertTrue(sent)
         kinds = [c[0] for c in self.fake_ua.calls]
         self.assertIn("send_media_group", kinds)     # album user account se
         self.assertEqual([c for c in self.bot.calls if c[0].startswith("send_")], [])
 
-    def test_fallback_to_bot_when_user_account_off(self):
+    def test_no_bot_fallback_when_user_account_off(self):
         advanced.user_account = FakeUserSender(available=False)
         b1 = advanced.db.add_user_bot(1, "tok", "clientbot")
         advanced.db.add_channel(b1, -1001, "pub", "Public")
         advanced.db.add_message(b1, -1001, "Hello there", None, None)
         msgs = advanced.db.get_messages(-1001, b1)
 
-        asyncio.run(advanced._send_messages_with_media_groups(
+        sent = asyncio.run(advanced._send_messages_with_media_groups(
             55, msgs, self.context, bot_id=b1, attach_start_button=True))
 
-        self.assertTrue(any(c[0] == "send_message" for c in self.bot.calls))
+        self.assertFalse(sent)
+        self.assertEqual(self.bot.calls, [])
+
+    def test_join_request_sends_dm_only_from_user_account_and_marks_reachable(self):
+        from types import SimpleNamespace
+
+        b1 = advanced.db.add_user_bot(1, "tok", "clientbot")
+        chat = SimpleNamespace(id=-1001, username="pub", title="Public")
+        advanced.db.add_channel(b1, chat.id, chat.username, chat.title)
+        advanced.db.add_message(b1, chat.id, "Welcome {first_name}!", None, None)
+        request = FakeJoinRequest(FakeRequester(), chat)
+
+        asyncio.run(advanced.handle_join_request(FakeUpdate(request), self.context, b1, 1))
+
+        self.assertEqual(self.fake_ua.primed, [(chat.id, FakeRequester.id)])
+        self.assertEqual([call[0] for call in self.fake_ua.calls], ["send_text", "send_text"])
+        self.assertEqual(self.bot.calls, [])
+        self.assertEqual(advanced.db.get_reachable_requesters_count(b1), 1)
+        self.assertEqual(advanced.db.get_pending_count(b1), 1)
+        self.assertFalse(request.approved)
+
+    def test_failed_user_account_delivery_is_not_marked_reachable(self):
+        from types import SimpleNamespace
+
+        failing_sender = FakeUserSender(available=True, fail=True)
+        advanced.user_account = failing_sender
+        b1 = advanced.db.add_user_bot(1, "tok", "clientbot")
+        chat = SimpleNamespace(id=-1001, username="pub", title="Public")
+        advanced.db.add_channel(b1, chat.id, chat.username, chat.title)
+        request = FakeJoinRequest(FakeRequester(), chat)
+
+        asyncio.run(advanced.handle_join_request(FakeUpdate(request), self.context, b1, 1))
+
+        self.assertEqual(len(failing_sender.calls), 2)
+        self.assertEqual(self.bot.calls, [])
+        self.assertEqual(advanced.db.get_reachable_requesters_count(b1), 0)
+        self.assertEqual(advanced.db.get_pending_count(b1), 1)
 
     def test_media_download_uses_bot_then_user_account_sends(self):
         """Media file_id bot ka hota hai: download bot se, bhejna user account se."""
@@ -138,7 +198,7 @@ class TestUserAccountMediaPipeline(unittest.TestCase):
                 self.sent.append({"user_id": user_id, "name": f.name,
                                   "data": f.read(), "caption": caption})
                 class M:  # noqa
-                    message_id = 9
+                    id = 9
                 return M()
 
         class DLBot:
@@ -187,7 +247,7 @@ class TestUserAccountMediaPipeline(unittest.TestCase):
             async def send_message(self, user_id, text, **kw):
                 self.sent.append((user_id, text, kw.get("parse_mode")))
                 class M:  # noqa
-                    message_id = 7
+                    id = 7
                 return M()
 
         sender = UserAccountSender()

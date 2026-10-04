@@ -96,6 +96,11 @@ class TestUserBots(unittest.TestCase):
         self.db.set_user_bot_active(b1, True)
         self.assertEqual(self.db.get_user_bot(b1)["is_active"], 1)
 
+    def test_persist_telegram_bot_id_for_session_routing(self):
+        b1 = self.db.add_user_bot(1, "t1", "botone")
+        self.db.set_user_bot_telegram_id(b1, 12345)
+        self.assertEqual(self.db.get_user_bot(b1)["tg_bot_id"], 12345)
+
     def test_remove_user_bot_cascades(self):
         b1 = self.db.add_user_bot(1, "t1", "botone")
         self.db.add_subscription_for_bot(b1, "Basic", 30)

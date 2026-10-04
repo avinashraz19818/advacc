@@ -15,17 +15,16 @@ except Exception:
     pass
 
 import user_sender as user_sender_mod
-from user_sender import UserAccountSender
+from user_sender import UserAccountSender, API_ID, API_HASH
+from telethon import TelegramClient
+from telethon.sessions import StringSession
+from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError, PhoneCodeExpiredError
 
 from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Bot,
-    InputMediaPhoto,
-    InputMediaVideo,
-    InputMediaDocument,
-    InputMediaAudio,
     MessageEntity,
 )
 from telegram.ext import (
@@ -582,20 +581,32 @@ class Database:
         next_num = max(numbers) + 1 if numbers else 1
         return f"{user_id}_{next_num}"
 
-    def add_user_bot(self, user_id, token, username):
+    def add_user_bot(self, user_id, token, username, tg_bot_id=None):
         # Token pehle se linked hai to wahi bot_id wapas (naya id mat banao)
         existing = self.user_bots.find_one({"bot_token": token})
         if existing:
-            self.user_bots.update_one(
-                {"bot_token": token},
-                {"$set": {"bot_username": username, "is_active": 1}})
+            upd = {"bot_username": username, "is_active": 1}
+            if tg_bot_id:
+                upd["tg_bot_id"] = tg_bot_id
+            self.user_bots.update_one({"bot_token": token}, {"$set": upd})
             return existing["bot_id"]
         bot_id = self.get_next_bot_id(user_id)
         self.add_user(user_id, None, f"User{user_id}", None)
         self.user_bots.insert_one({
             "bot_id": bot_id, "user_id": user_id, "bot_token": token,
-            "bot_username": username, "is_active": 1, "created_at": now_aware()})
+            "bot_username": username, "is_active": 1,
+            "tg_bot_id": tg_bot_id, "user_session": None,
+            "created_at": now_aware()})
         return bot_id
+
+    def set_user_session(self, bot_id: str, session_str: str):
+        self.user_bots.update_one({"bot_id": bot_id},
+                                  {"$set": {"user_session": session_str or None}})
+
+    def set_user_bot_telegram_id(self, bot_id: str, tg_bot_id: int):
+        if tg_bot_id is not None:
+            self.user_bots.update_one(
+                {"bot_id": bot_id}, {"$set": {"tg_bot_id": int(tg_bot_id)}})
 
     def get_user_bot(self, bot_id: str):
         return self._doc(self.user_bots.find_one({"bot_id": bot_id}))
@@ -1031,8 +1042,8 @@ class Database:
 db: Optional[Database] = None
 user_bot_applications: Dict[str, Application] = {}
 
-# User-account sender ka singleton (user_sender.py) — saari user-facing
-# delivery isi ke through hoti hai, bot sirf fallback hai.
+# User-account sender ka singleton (user_sender.py). User-facing DMs ka ek hi
+# sender hai: logged-in Telegram user account. Bot API fallback jaan-bujhkar band hai.
 user_account: UserAccountSender = user_sender_mod.user_sender
 
 
@@ -1768,52 +1779,101 @@ async def safe_copy_message(bot, chat_id: int, from_chat_id: int, message_id: in
         return None
 
 
+# ================= ADD USERBOT WIZARD (login finish) =================
+async def _finish_userbot_login(wz: dict, context, msg, session_str: str):
+    """Validate the user session before saving it and enabling outbound DMs."""
+    try:
+        if not session_str or not isinstance(session_str, str):
+            raise ValueError("Empty user-account session")
+        lc = wz.get("client")
+        if lc is None:
+            lc = await user_account.get_client(session_str)
+        else:
+            try:
+                connected = lc.is_connected()
+            except Exception:
+                connected = False
+            if not connected:
+                lc = await user_account.get_client(session_str)
+        if lc is None:
+            raise ValueError("User-account session is invalid/expired or could not connect")
+        if not await lc.is_user_authorized():
+            raise ValueError("User-account session is not authorized")
+        me = await lc.get_me()
+        if me is None:
+            raise ValueError("Could not verify the logged-in user account")
+        bot_id = db.add_user_bot(wz["user_id"], wz["bot_token"], wz["bot_username"],
+                                 tg_bot_id=wz.get("tg_bot_id"))
+        db.set_user_session(bot_id, session_str)
+        user_account.attach_client(session_str, lc, bot_id, wz.get("tg_bot_id"))
+        context.user_data.pop("ubwiz", None)
+        acct = f"<b>{getattr(me, 'first_name', 'User')}</b>"
+        uname = getattr(me, "username", None)
+        acct += f" (@{uname})" if uname else ""
+        await reply_premium_message(msg,
+            f"<blockquote>{pp('✅')} <b>USER ACCOUNT LOGIN SUCCESS</b></blockquote>\n\n"
+            f"{pp('👤')} Account: {acct}\n"
+            f"{pp('🤖')} Bot: @{wz['bot_username']}\n"
+            f"{pp('🆔')} Bot ID: <code>{bot_id}</code>\n\n"
+            f"{pp('⭐️')} Ab <b>subscription add</b> karo - user account chalu ho jayega:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [btn("Add Subscription", "admin_add_sub", "success", "⭐️")],
+                [btn("Admin Panel", "admin_panel", "primary", "🔙")],
+            ]))
+    except Exception as ex:
+        logging.error(f"_finish_userbot_login error: {ex}")
+        await reply_premium_message(msg, f"{pe('❌')} Save error: {ex}", parse_mode=ParseMode.HTML)
+
+
 # ================= USER-ACCOUNT DELIVERY =================
-# User-facing messages ab BOT se nahi, USER ACCOUNT se jaate hain (user_sender.py).
-# Agar user-account unavailable/fail ho to BOT fallback use hota hai.
+# End-user DMs sirf user_sender.py ke logged-in user account se jaate hain.
+# User account fail/offline ho to delivery fail hoti hai; Bot API fallback nahi hai.
 async def deliver_text(user_id: int, text: str, bot, reply_markup=None,
                        parse_mode=ParseMode.HTML, use_user_account: bool = True) -> Optional[int]:
-    """Text deliver karo: pehle user-account, phir bot fallback. message_id return."""
-    if use_user_account and user_account.available():
-        try:
-            mid = await user_account.send_text(user_id, text, reply_markup)
-            if mid:
-                return mid
-        except Exception as ex:
-            logging.warning(f"user-account text delivery failed for {user_id}: {ex}")
+    if not use_user_account:
+        return None
+    if not (text or "").strip():
+        return None
     try:
-        sent = await send_user_message(bot, user_id, text, parse_mode=parse_mode, reply_markup=reply_markup)
-        return sent.message_id if sent else None
+        if not user_account.available(bot=bot):
+            logging.warning("User-account unavailable for %s; Bot API fallback disabled", user_id)
+            return None
+        mid = await user_account.send_text(user_id, text, reply_markup, bot=bot)
+        if mid:
+            logging.info("user-account text delivered to %s (message_id=%s)", user_id, mid)
+        return mid
     except Exception as ex:
-        logging.error(f"deliver_text bot fallback failed for {user_id}: {ex}")
+        logging.error("user-account text failed for %s; Bot API fallback disabled: %s", user_id, ex)
         return None
 
 
 async def deliver_media(user_id: int, media_id, media_type, text: str, bot, markup=None,
                         entities_json: Optional[str] = None, file_name: Optional[str] = None,
                         mime_type: Optional[str] = None, use_user_account: bool = True) -> bool:
-    """Media deliver karo: pehle user-account (bot se download + re-upload), phir bot fallback."""
+    if not use_user_account:
+        return False
     is_media = bool(media_id) and media_type not in (None, "text")
-    if use_user_account and user_account.available():
-        try:
-            mid = None
-            if is_media:
-                display_caption = MessageManager.prepare_for_sending(text, entities_json) if text else ""
-                mid = await user_account.send_media(user_id, media_id, media_type, display_caption or "",
-                                                    markup, file_name, mime_type, bot)
-            elif (text or "").strip():
-                display_text = MessageManager.prepare_for_sending(text, entities_json)
-                mid = await user_account.send_text(user_id, display_text, markup)
-            if mid:
-                return True
-        except Exception as ex:
-            logging.warning(f"user-account media delivery failed for {user_id}: {ex}")
+    if not is_media and not (text or "").strip():
+        return False
     try:
-        await send_media(bot, user_id, media_id, media_type or "text", text or "", markup,
-                         entities_json=entities_json, file_name=file_name, mime_type=mime_type)
-        return True
+        if not user_account.available(bot=bot):
+            logging.warning("User-account unavailable for %s; Bot API fallback disabled", user_id)
+            return False
+        if is_media:
+            caption = MessageManager.prepare_for_sending(text, entities_json) if text else ""
+            mid = await user_account.send_media(
+                user_id, media_id, media_type, caption or "", markup,
+                file_name, mime_type, bot=bot,
+            )
+        else:
+            display_text = MessageManager.prepare_for_sending(text, entities_json)
+            mid = await user_account.send_text(user_id, display_text, markup, bot=bot)
+        if mid:
+            logging.info("user-account media/text delivered to %s (message_id=%s)", user_id, mid)
+        return bool(mid)
     except Exception as ex:
-        logging.error(f"deliver_media bot fallback failed for {user_id}: {ex}")
+        logging.error("user-account media failed for %s; Bot API fallback disabled: %s", user_id, ex)
         return False
 
 
@@ -1870,7 +1930,8 @@ async def subscription_reminder_job(context: ContextTypes.DEFAULT_TYPE):
 
 # ================= MESSAGE SENDING =================
 async def _send_messages_with_media_groups(chat_id: int, msgs: List[dict], context: ContextTypes.DEFAULT_TYPE,
-                                            bot_id: str = None, attach_start_button: bool = True, placeholder_user=None):
+                                            bot_id: str = None, attach_start_button: bool = True, placeholder_user=None) -> bool:
+    """Deliver a configured welcome sequence only through its user account."""
     live_chat_markup = None
     if bot_id and attach_start_button:
         try:
@@ -1881,6 +1942,7 @@ async def _send_messages_with_media_groups(chat_id: int, msgs: List[dict], conte
         except Exception:
             pass
 
+    any_sent = False
     i = 0
     while i < len(msgs):
         row = msgs[i]
@@ -1894,60 +1956,57 @@ async def _send_messages_with_media_groups(chat_id: int, msgs: List[dict], conte
         mime_type = row.get("mime_type")
 
         if media_group_id:
-            group_items = []          # bot fallback ke liye InputMedia list
-            group_rows = []           # user-account path ke liye raw rows
+            group_rows = []
             extra_captions = []
             group_buttons_json = None
             group_caption_text = None
             j = i
             while j < len(msgs) and msgs[j].get("media_group_id") == media_group_id:
-                g = msgs[j]
-                g_text = render_dynamic_text(g.get("content_text", ""), placeholder_user)
-                g_media_id = g.get("media_id")
-                g_media_type = g.get("media_type")
-                if not group_buttons_json and g.get("buttons_json"):
-                    group_buttons_json = g.get("buttons_json")
-                if g_media_id and g_media_type in ("photo", "video", "document", "audio"):
-                    display_text = MessageManager.prepare_for_sending(g_text, g.get("entities_json")) if g_text else None
-                    pm = ParseMode.HTML if display_text else None
+                group_row = msgs[j]
+                group_text = render_dynamic_text(group_row.get("content_text", ""), placeholder_user)
+                group_media_id = group_row.get("media_id")
+                group_media_type = group_row.get("media_type")
+                if not group_buttons_json and group_row.get("buttons_json"):
+                    group_buttons_json = group_row.get("buttons_json")
+                if group_media_id and group_media_type in ("photo", "video", "document", "audio"):
+                    display_text = MessageManager.prepare_for_sending(
+                        group_text, group_row.get("entities_json")) if group_text else None
                     if display_text:
                         if not group_caption_text:
                             group_caption_text = display_text
                         else:
                             extra_captions.append(display_text)
-                    group_rows.append({"media_id": g_media_id, "media_type": g_media_type,
-                                       "file_name": g.get("file_name")})
-                    if g_media_type == "photo":
-                        group_items.append(InputMediaPhoto(media=g_media_id, caption=display_text or None, parse_mode=pm))
-                    elif g_media_type == "video":
-                        group_items.append(InputMediaVideo(media=g_media_id, caption=display_text or None, parse_mode=pm))
-                    elif g_media_type == "document":
-                        group_items.append(InputMediaDocument(media=g_media_id, caption=display_text or None, parse_mode=pm))
+                    group_rows.append({
+                        "media_id": group_media_id,
+                        "media_type": group_media_type,
+                        "file_name": group_row.get("file_name"),
+                    })
                 j += 1
 
             delivered = False
-            if group_rows and user_account.available():
+            if group_rows and user_account.available(bot=context.bot):
                 try:
-                    ids = await user_account.send_media_group(
+                    message_ids = await user_account.send_media_group(
                         chat_id, group_rows, context.bot,
                         caption=group_caption_text,
                         markup=buttons_to_markup(group_buttons_json))
-                    delivered = bool(ids)
+                    delivered = bool(message_ids)
                 except Exception as ex:
-                    logging.warning(f"user-account media group failed for {chat_id}: {ex}")
-            if not delivered and group_items:
-                try:
-                    await context.bot.send_media_group(chat_id=chat_id, media=group_items)
-                    delivered = True
-                except BadRequest as ex:
-                    logging.error(f"send_media_group failed for {chat_id}: {ex}")
-            if delivered and extra_captions:
-                for cap in extra_captions:
-                    await deliver_text(chat_id, strip_premium_emojis(cap), context.bot)
-            group_markup = buttons_to_markup(group_buttons_json)
-            if group_markup:
-                await deliver_text(chat_id, strip_premium_emojis(group_caption_text) or "Open links:",
-                                   context.bot, reply_markup=group_markup)
+                    logging.warning("User-account media group failed for %s: %s", chat_id, ex)
+            if group_rows and not delivered:
+                logging.warning("Album for %s was not sent; Bot API fallback is disabled", chat_id)
+            any_sent = any_sent or delivered
+
+            if delivered:
+                for caption in extra_captions:
+                    sent_id = await deliver_text(chat_id, strip_premium_emojis(caption), context.bot)
+                    any_sent = bool(sent_id) or any_sent
+                group_markup = buttons_to_markup(group_buttons_json)
+                if group_markup:
+                    sent_id = await deliver_text(
+                        chat_id, strip_premium_emojis(group_caption_text) or "Open links:",
+                        context.bot, reply_markup=group_markup)
+                    any_sent = bool(sent_id) or any_sent
             i = j
             continue
 
@@ -1958,25 +2017,29 @@ async def _send_messages_with_media_groups(chat_id: int, msgs: List[dict], conte
                 markup = InlineKeyboardMarkup(combined_rows)
             else:
                 markup = live_chat_markup
-        await deliver_media(chat_id, media_id, media_type, text or "", context.bot, markup,
-                            entities_json=entities_json, file_name=file_name, mime_type=mime_type)
+        sent = await deliver_media(
+            chat_id, media_id, media_type, text or "", context.bot, markup,
+            entities_json=entities_json, file_name=file_name, mime_type=mime_type)
+        any_sent = bool(sent) or any_sent
         i += 1
 
+    return any_sent
 
-async def send_saved_welcome(bot_id: str, chat_id: int, context: ContextTypes.DEFAULT_TYPE, user=None):
+
+async def send_saved_welcome(bot_id: str, chat_id: int, context: ContextTypes.DEFAULT_TYPE, user=None) -> bool:
     try:
         channels = db.get_bot_channels(bot_id) or []
         if not channels:
-            await deliver_text(chat_id, render_dynamic_text(DEFAULT_WELCOME_MESSAGE, user), context.bot)
-            return
+            return bool(await deliver_text(chat_id, render_dynamic_text(DEFAULT_WELCOME_MESSAGE, user), context.bot))
         channel_id = channels[0]["channel_id"]
         msgs = db.get_messages(channel_id, bot_id) or []
         if not msgs:
-            await deliver_text(chat_id, render_dynamic_text(DEFAULT_WELCOME_MESSAGE, user), context.bot)
-            return
-        await _send_messages_with_media_groups(chat_id, msgs, context, bot_id=bot_id, placeholder_user=user)
+            return bool(await deliver_text(chat_id, render_dynamic_text(DEFAULT_WELCOME_MESSAGE, user), context.bot))
+        return await _send_messages_with_media_groups(
+            chat_id, msgs, context, bot_id=bot_id, placeholder_user=user)
     except Exception as ex:
-        logging.error(f"send_saved_welcome error: {ex}")
+        logging.error("send_saved_welcome failed for %s: %s", chat_id, ex)
+        return False
 
 
 def _runtime_store(context: ContextTypes.DEFAULT_TYPE, key: str) -> dict:
@@ -2757,17 +2820,18 @@ async def delete_pending_leave_recovery_messages(bot_id: str, user_id: int, targ
     deleted = 0
     for row_id, message_id in db.get_pending_leave_recovery_messages(bot_id, user_id, target_channel_id):
         try:
-            # Message user-account se gaya tha to usi se delete hoga
-            ok = False
-            if user_account.available():
-                ok = await user_account.delete_message(user_id, message_id)
-            if not ok:
-                await bot.delete_message(chat_id=user_id, message_id=message_id)
-            deleted += 1
-        except Exception:
-            pass
-        finally:
-            db.mark_leave_recovery_deleted(row_id)
+            # These DMs were sent by the user account. Do not try to manage them via Bot API.
+            if not user_account.available(bot=bot):
+                logging.warning("Cannot delete leave-recovery DM %s: matching user account is unavailable", message_id)
+                continue
+            ok = await user_account.delete_message(user_id, message_id, bot=bot)
+            if ok:
+                db.mark_leave_recovery_deleted(row_id)
+                deleted += 1
+            else:
+                logging.warning("Leave-recovery DM %s was not deleted; it remains pending", message_id)
+        except Exception as ex:
+            logging.warning("Leave-recovery DM delete failed for %s: %s", message_id, ex)
     return deleted
 
 
@@ -2779,58 +2843,79 @@ async def handle_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE
     chat = jr.chat
 
     leave_cfg = db.get_leave_recovery_config()
-    if (leave_cfg.get("enabled") and leave_cfg.get("target_channel_id") and int(leave_cfg["target_channel_id"]) == int(chat.id)):
+    if (leave_cfg.get("enabled") and leave_cfg.get("target_channel_id")
+            and int(leave_cfg["target_channel_id"]) == int(chat.id)):
         channel_configs = leave_cfg.get("channel_configs", {})
-        chan_key = str(chat.id)
-        chan_enabled = channel_configs.get(chan_key, True)
+        chan_enabled = channel_configs.get(str(chat.id), True)
         if chan_enabled:
             await delete_pending_leave_recovery_messages(bot_id, requester.id, int(chat.id), context.bot)
         try:
             await jr.approve()
         except Exception as ex:
-            if 'User_already_participant' not in str(ex):
-                logging.error(f"Leave recovery target approve error: {ex}")
+            if "User_already_participant" not in str(ex):
+                logging.error("Leave recovery target approve error: %s", ex)
         return
 
     channel_row = db.get_channel_owner_data(chat.id, bot_id)
     if not channel_row:
         try:
             member = await context.bot.get_chat_member(chat.id, context.bot.id)
-            if member.status in ['administrator', 'creator']:
-                db.add_channel(bot_id, chat.id, getattr(chat, 'username', None), chat.title or "Channel")
+            if member.status in ["administrator", "creator"]:
+                db.add_channel(bot_id, chat.id, getattr(chat, "username", None), chat.title or "Channel")
                 channel_row = db.get_channel_owner_data(chat.id, bot_id)
-        except Exception:
-            pass
+        except Exception as ex:
+            logging.warning("Could not verify managed channel %s: %s", chat.id, ex)
         if not channel_row:
             return
 
-    auto = int(channel_row.get("auto_approve", 0)) == 1 if channel_row else False
-
+    # Resolve the Telegram entity with the same user account that will send the DM.
+    # This is required because Bot API user ids do not include Telethon access_hashes.
     try:
-        default_msg_text = db.get_default_first_message()
-        default_msg_text = render_dynamic_text(default_msg_text, requester)
-        # USER-ACCOUNT se bhejo (bot fallback deliver_text ke andar hai)
-        await deliver_text(requester.id, default_msg_text, context.bot)
-    except Exception as ex:
-        logging.error(f"Default first message send error: {ex}")
-
-    msgs = db.get_messages(chat.id, bot_id) if channel_row else []
-    try:
-        if msgs:
-            await _send_messages_with_media_groups(requester.id, msgs, context, bot_id=bot_id, attach_start_button=True, placeholder_user=requester)
+        if not user_account.available(bot=context.bot):
+            logging.error("Join request %s: no user-account sender is configured; no Bot API fallback", requester.id)
         else:
-            wm = channel_row.get("welcome_message") if channel_row else DEFAULT_WELCOME_MESSAGE
-            wm = render_dynamic_text(wm, requester)
-            wid = channel_row.get("welcome_media_id") if channel_row else None
-            wtype = channel_row.get("welcome_media_type") if channel_row else None
-            markup = buttons_to_markup(buttons_json_from_text(wm) or None)
-            if wid and wtype:
-                await deliver_media(requester.id, wid, wtype, wm, context.bot, markup)
-            elif wm:
-                await deliver_text(requester.id, wm, context.bot, reply_markup=markup)
-        db.mark_reachable(bot_id, requester.id)
+            await user_account.prime_requester(chat.id, requester.id, bot=context.bot)
     except Exception as ex:
-        logging.error(f"Send welcome error: {ex}")
+        logging.warning("Could not prime user-account entity for %s: %s", requester.id, ex)
+
+    auto = int(channel_row.get("auto_approve", 0)) == 1
+    delivery_succeeded = False
+    try:
+        default_msg_text = render_dynamic_text(db.get_default_first_message(), requester)
+        sent_id = await deliver_text(requester.id, default_msg_text, context.bot)
+        delivery_succeeded = bool(sent_id)
+    except Exception as ex:
+        logging.error("Default first message send failed for %s: %s", requester.id, ex)
+
+    try:
+        msgs = db.get_messages(chat.id, bot_id) or []
+        if msgs:
+            welcome_sent = await _send_messages_with_media_groups(
+                requester.id, msgs, context, bot_id=bot_id,
+                attach_start_button=True, placeholder_user=requester)
+        else:
+            welcome_text = render_dynamic_text(
+                channel_row.get("welcome_message") or DEFAULT_WELCOME_MESSAGE, requester)
+            welcome_media_id = channel_row.get("welcome_media_id")
+            welcome_media_type = channel_row.get("welcome_media_type")
+            markup = buttons_to_markup(buttons_json_from_text(welcome_text) or None)
+            if welcome_media_id and welcome_media_type:
+                welcome_sent = await deliver_media(
+                    requester.id, welcome_media_id, welcome_media_type,
+                    welcome_text, context.bot, markup)
+            elif welcome_text:
+                welcome_sent = bool(await deliver_text(
+                    requester.id, welcome_text, context.bot, reply_markup=markup))
+            else:
+                welcome_sent = False
+        delivery_succeeded = bool(welcome_sent) or delivery_succeeded
+    except Exception as ex:
+        logging.error("Welcome delivery failed for %s: %s", requester.id, ex)
+
+    if delivery_succeeded:
+        db.mark_reachable(bot_id, requester.id)
+    else:
+        logging.error("Join request %s was recorded, but the user-account DM was not delivered", requester.id)
 
     db.add_join_request(bot_id, requester.id, chat.id, 'approved' if auto else 'pending')
     if auto:
@@ -2927,6 +3012,12 @@ async def start_user_bot(token: str, bot_id: str, owner_id: int):
     app.add_handler(ChatJoinRequestHandler(lambda u, c: handle_join_request(u, c, bot_id, owner_id)))
     app.add_handler(ChatMemberHandler(lambda u, c: handle_channel_member_update(u, c, bot_id, owner_id), ChatMemberHandler.CHAT_MEMBER))
     await app.initialize()
+    bot_info = await app.bot.get_me()
+    if getattr(bot_info, "id", None) is not None:
+        db.set_user_bot_telegram_id(bot_id, bot_info.id)
+        bot_record = db.get_user_bot(bot_id) or {}
+        if bot_record.get("user_session"):
+            user_account.register_session(bot_id, bot_record["user_session"], bot_info.id)
     await app.start()
     await app.updater.start_polling(allowed_updates=["message", "callback_query", "chat_member", "chat_join_request", "inline_query"])
     user_bot_applications[bot_id] = app
@@ -2989,12 +3080,13 @@ async def send_user_broadcast(q, context: ContextTypes.DEFAULT_TYPE, bot_id: str
                 db.mark_reachable(bot_id, r)
                 sent += 1
             else:
-                db.mark_unreachable(bot_id, r)
+                # A transient session/network error is not proof that the user is
+                # unreachable; keep them eligible for the next user-account send.
                 fail += 1
         except Forbidden:
-            db.mark_unreachable(bot_id, r)
             fail += 1
         except Exception as ex:
+            logging.warning("User-account broadcast failed for %s: %s", r, ex)
             fail += 1
         if (sent + fail) % 30 == 0:
             try:
@@ -3345,8 +3437,15 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data == "admin_add_userbot":
             if not is_admin(uid):
                 return
-            await safe_edit_message_text(q, f"<blockquote>{pp('🚀')} <b>ADD USERBOT</b></blockquote>\n\nSend: <code>user_id bot_token</code>\nExample: <code>123456789 123456:ABCdef...</code>", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[btn("Back", "admin_panel", "primary", "🔙")]]))
-            context.user_data["admin_add_userbot"] = True
+            context.user_data["ubwiz"] = {"step": "ask_user_id"}
+            await safe_edit_message_text(q,
+                f"<blockquote>{pp('🚀')} <b>ADD USERBOT - STEP 1/4</b></blockquote>\n\n"
+                f"Client ka <b>Telegram User ID</b> bhejo (sirf numbers):\n"
+                f"<i>Example:</i> <code>7251902885</code>\n\n"
+                f"{pp('💡')} User ID: @userinfobot se pata karo\n\n"
+                f"{pp('🛑')} Cancel karne ke liye <code>cancel</code> likho",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[btn("Cancel", "admin_panel", "danger", "❌")]]))
             return
 
         if data == "admin_add_sub":
@@ -3695,6 +3794,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if data.startswith("admin_remove_bot_confirm_"):
                 bot_id = data.replace("admin_remove_bot_confirm_", "")
                 await stop_user_bot(bot_id)
+                await user_account.unregister_session(bot_id)
                 db.remove_user_bot(bot_id)
                 await safe_edit_message_text(q, f"{pe('✅')} UserBot removed.", parse_mode=ParseMode.HTML, reply_markup=admin_kb())
             else:
@@ -3803,21 +3903,126 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await reply_premium_message(msg, f"{pe('❌')} Invalid token format. Please send the correct BotFather token.", parse_mode=ParseMode.HTML)
         return
 
-    if context.user_data.get("admin_add_userbot") and is_admin(user.id):
-        parts = msg.text.strip().split()
-        if len(parts) == 2 and parts[0].isdigit():
-            target = int(parts[0])
-            token = parts[1]
+    wz = context.user_data.get("ubwiz")
+    if wz and is_admin(user.id):
+        step = wz.get("step")
+        text_in = (msg.text or "").strip()
+        if text_in.lower() in ("cancel", "/cancel"):
+            lc = wz.get("client")
+            if lc:
+                try:
+                    await lc.disconnect()
+                except Exception:
+                    pass
+            context.user_data.pop("ubwiz", None)
+            await reply_premium_message(msg, f"{pe('❌')} Add UserBot cancel kar diya.", parse_mode=ParseMode.HTML, reply_markup=admin_kb())
+            return
+
+        if step == "ask_user_id":
+            if not text_in.lstrip("-").isdigit():
+                await reply_premium_message(msg, f"{pe('❌')} Sirf numbers bhejo. Example: <code>7251902885</code>", parse_mode=ParseMode.HTML)
+                return
+            wz["user_id"] = int(text_in)
+            wz["step"] = "ask_token"
+            await reply_premium_message(msg,
+                f"<blockquote>{pp('🤖')} <b>ADD USERBOT - STEP 2/4</b></blockquote>\n\n"
+                f"Client ke <b>BOT ka BotFather token</b> bhejo:\n"
+                f"<i>Example:</i> <code>123456789:ABCdef...</code>",
+                parse_mode=ParseMode.HTML)
+            return
+
+        if step == "ask_token":
+            token = text_in
+            if ":" not in token or len(token) < 10:
+                await reply_premium_message(msg, f"{pe('❌')} Token format galat hai.", parse_mode=ParseMode.HTML)
+                return
             try:
                 test_bot = Bot(token=token)
                 bot_info = await test_bot.get_me()
-                bot_id = db.add_user_bot(target, token, bot_info.username)
-                context.user_data.pop("admin_add_userbot", None)
-                await reply_premium_message(msg, f"{pe('✅')} Bot @{bot_info.username} linked to user {target}\nBot ID: {bot_id}", parse_mode=ParseMode.HTML, reply_markup=admin_kb())
             except Exception as ex:
-                await reply_premium_message(msg, f"{pe('❌')} Error: {ex}", parse_mode=ParseMode.HTML, reply_markup=admin_kb())
-        else:
-            await reply_premium_message(msg, f"{pe('❌')} Format: <code>user_id bot_token</code>", parse_mode=ParseMode.HTML, reply_markup=admin_kb())
+                await reply_premium_message(msg, f"{pe('❌')} Token invalid: {ex}", parse_mode=ParseMode.HTML)
+                return
+            wz["bot_token"] = token
+            wz["bot_username"] = bot_info.username
+            wz["tg_bot_id"] = bot_info.id
+            wz["step"] = "ask_phone"
+            await reply_premium_message(msg,
+                f"<blockquote>{pp('📱')} <b>ADD USERBOT - STEP 3/4</b></blockquote>\n\n"
+                f"{pe('✅')} Bot: <b>@{bot_info.username}</b>\n\n"
+                f"Ab client ke <b>USER ACCOUNT ka phone number</b> bhejo\n"
+                f"(jis account se DM jaayenge, country code ke saath):\n"
+                f"<i>Example:</i> <code>+919876543210</code>",
+                parse_mode=ParseMode.HTML)
+            return
+
+        if step == "ask_phone":
+            sess_in = text_in.replace(' ', '').replace('\n', '')
+            if len(sess_in) > 150:
+                wz['phone'] = wz.get('phone') or '(session)'
+                wz['client'] = wz.get('client')
+                try:
+                    await _finish_userbot_login(wz, context, msg, sess_in)
+                except Exception as exx:
+                    await reply_premium_message(msg, f"{pe('❌')} Session login problem: {exx}", parse_mode=ParseMode.HTML)
+                return
+            phone = text_in.replace(" ", "")
+            if not phone.startswith("+") or not phone[1:].isdigit():
+                await reply_premium_message(msg, f"{pe('❌')} Format: <code>+919876543210</code>", parse_mode=ParseMode.HTML)
+                return
+            try:
+                lc = await user_account.start_login(phone)
+            except Exception as ex:
+                if 'CAPTCHA' in str(ex).upper():
+                    await reply_premium_message(msg, f"{pe('🛡')} Telegram ne is VM ke IP par captcha laga diya hai - OTP VM se nahi ja sakta.\n\n{pe('✅')} Fix: phone (Termux) ya PC par make_session.py chalao, wahan phone + OTP do, SESSION STRING yahin STEP 3 me paste karo.\n\n{pe('🔁')} Ya phone dobara bhejo.", parse_mode=ParseMode.HTML)
+                    return
+                await reply_premium_message(msg, f"{pe('❌')} Login start nahi hua: {ex}", parse_mode=ParseMode.HTML)
+                return
+            wz["client"] = lc
+            wz["phone"] = phone
+            wz["step"] = "ask_code"
+            await reply_premium_message(msg,
+                f"<blockquote>{pp('🔐')} <b>ADD USERBOT - STEP 4/4</b></blockquote>\n\n"
+                f"{pe('📩')} <b>{phone}</b> par <b>OTP</b> bheja gaya hai (Telegram app me).\n\n"
+                f"Woh <b>OTP code</b> bhejo:",
+                parse_mode=ParseMode.HTML)
+            return
+
+        if step == "ask_code":
+            code = text_in.replace(" ", "")
+            lc = wz.get("client")
+            if not lc:
+                context.user_data.pop("ubwiz", None)
+                await reply_premium_message(msg, f"{pe('❌')} Session lost. Dobara Add UserBot chalao.", parse_mode=ParseMode.HTML, reply_markup=admin_kb())
+                return
+            if not code.isdigit():
+                await reply_premium_message(msg, f"{pe('❌')} OTP sirf digits hote hain.", parse_mode=ParseMode.HTML)
+                return
+            session_str, need_2fa, err = await user_account.complete_login(lc, wz["phone"], code)
+            if err:
+                await reply_premium_message(msg, f"{pe('❌')} {err}", parse_mode=ParseMode.HTML)
+                return
+            if need_2fa:
+                wz["step"] = "ask_2fa"
+                await reply_premium_message(msg,
+                    f"<blockquote>{pp('🔒')} <b>2FA REQUIRED</b></blockquote>\n\n"
+                    f"Client ke account ka <b>2FA password</b> bhejo:",
+                    parse_mode=ParseMode.HTML)
+                return
+            await _finish_userbot_login(wz, context, msg, session_str)
+            return
+
+        if step == "ask_2fa":
+            lc = wz.get("client")
+            if not lc:
+                context.user_data.pop("ubwiz", None)
+                await reply_premium_message(msg, f"{pe('❌')} Session lost. Dobara Add UserBot chalao.", parse_mode=ParseMode.HTML, reply_markup=admin_kb())
+                return
+            session_str, err = await user_account.complete_2fa(lc, text_in)
+            if err:
+                await reply_premium_message(msg, f"{pe('❌')} {err}", parse_mode=ParseMode.HTML)
+                return
+            await _finish_userbot_login(wz, context, msg, session_str)
+            return
         return
 
     if context.user_data.get("admin_add_sub") and is_admin(user.id):
@@ -4094,11 +4299,18 @@ async def main():
     # ── MongoDB connect (new database setup) ───────────────────────────
     init_database()
 
-    # ── User-account sender start (messages ab user account se jayenge) ─
+    # ── User-account sender start (all recipient DMs use these sessions) ─
     await user_account.start()
-    if not user_account.available():
-        logging.warning("User-account delivery OFF — bot fallback use hoga. "
-                        "Session banane ke liye: python3 login_userbot.py")
+    for bot_record in db.get_all_user_bots():
+        if bot_record.get("user_session"):
+            user_account.register_session(
+                bot_record["bot_id"], bot_record["user_session"], bot_record.get("tg_bot_id"))
+            logging.info("Registered user-account session for %s", bot_record["bot_id"])
+    if not user_account.configured():
+        logging.error("No user-account session configured; recipient DMs will fail. Bot API fallback is disabled.")
+    else:
+        connected_accounts = await user_account.warm_up_sessions()
+        logging.info("User-account session warm-up complete: %s account(s) connected", connected_accounts)
 
     expired_bots = db.get_expired_subscriptions()
     for bot_id in expired_bots:

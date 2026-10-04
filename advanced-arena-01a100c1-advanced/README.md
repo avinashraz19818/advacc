@@ -4,7 +4,7 @@ Ye `advanced` bot ka **naya modified version** hai. Do bade changes:
 
 | # | Pehle (old) | Ab (new) |
 |---|-------------|----------|
-| 1 | User ko messages **bot** bhejta tha (welcome / broadcast / leave-recovery) | Ab saari user-facing messages ek real **user account** (Telethon) se jaati hain — bot sirf panel + join-request events ke liye hai |
+| 1 | Welcome / broadcast / leave-recovery DMs bot API se bhi ja sakte the | Ab recipient DMs sirf logged-in **user account** (Telethon) se jaate hain; bot fallback band hai |
 | 2 | Database **PostgreSQL** tha (hardcoded localhost) | Database ab **MongoDB** hai (Atlas ya local, `.env` se configure) |
 
 ---
@@ -101,15 +101,15 @@ join request (channel)
 advanced.py  ── handle_join_request()
       │
       ├── deliver_text()  ──► user_sender.py (Telethon USER ACCOUNT) ──► DM user ko
-      │                         │ fail? → bot fallback
       ├── deliver_media() ──────┘
-      │
+      │                         (failure par retry/log; Bot API fallback nahi)
       └── MongoDB (users / user_bots / subscriptions / channels / messages / join_requests ...)
 ```
 
-- **Bot** = panel UI + join-request events + fallback delivery
-- **User account** = asli delivery (welcome, broadcast, leave-recovery)
+- **Bot** = panel UI + join-request events/approval; recipient welcome/broadcast DMs nahi bhejta
+- **User account** = recipient delivery (welcome, broadcast, leave-recovery)
 - **MongoDB** = saara data (`MONGO_URI` / `MONGO_DB`)
+- Bot process online rehna zaroori hai taaki join-request event receive ho; sirf Bot API sender/fallback band hai
 
 ## Tests
 
@@ -124,7 +124,9 @@ Database layer aur delivery-routing ke tests `tests/` me hain (mongomock ke saat
 
 ## Notes / Troubleshooting
 
-- `USERBOT_SESSION invalid/expired` → `python3 login_userbot.py` se naya session banao
-- DM nahi ja rahe → user account ne privacy restrict ki ho sakti hai; bot fallback automatic hai
-- Media nahi ja rahi → bot ko media tak access chahiye (bot admin ho channel me)
-- FloodWait aaye to user_sender automatically wait karke retry karta hai
+- `USERBOT_SESSION invalid/expired` → naya session banao; per-client login ke baad account mapping/startup logs verify karo
+- DM nahi ja rahe → logs me `No user-account session`, session/auth errors, entity lookup, ya Telegram privacy/block errors check karo. Bot fallback intentionally nahi hai.
+- Join-request DM ke liye logged-in user account ko channel admin banao, taaki requester entity resolve ho sake
+- Media source bot se download hoti hai aur user account se re-upload; source bot ko file access chahiye
+- FloodWait par sender Telegram ka poora required wait karta hai, phir limited retries karta hai
+- Account/session unavailable ho to DM skip hota hai; bot account se bhejne ki koshish nahi hoti
