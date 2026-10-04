@@ -1,0 +1,11 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Secrets / runtime
+.env
+*.session
+sessions/
+bot.log
+bot.pid

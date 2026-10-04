@@ -1,0 +1,2 @@
+# Tests ke liye extra dependencies
+mongomock>=4.1.0
