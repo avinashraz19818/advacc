@@ -2720,9 +2720,14 @@ async def handle_user_bot_message(update: Update, context: ContextTypes.DEFAULT_
                     old_job.schedule_removal()
                 except Exception:
                     pass
-            j = context.job_queue.run_once(_flush_media_group_job, when=1.2,
+            j = context.job_queue.run_once(
+                _flush_media_group_job,
+                when=1.2,
                 data={"bot_id": bot_id, "actor_uid": uid, "managed_uid": owner_id,
-                      "chat_id": msg.chat_id, "media_group_id": media_group_id})
+                      "chat_id": msg.chat_id, "media_group_id": media_group_id},
+                # PTB job callbacks need user_id to restore this sender's user_data.
+                user_id=uid,
+            )
             ud[job_key] = j
             return
 
