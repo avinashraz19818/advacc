@@ -58,10 +58,11 @@ def main() -> int:
 
     async def _login() -> str:
         await client.connect()
-        await client.send_code_request(phone)
+        sent_code = await client.send_code_request(phone)
+        phone_code_hash = sent_code.phone_code_hash
         code = input("🔑 OTP code (Telegram se aaya hua): ").strip()
         try:
-            await client.sign_in(phone=phone, code=code)
+            await client.sign_in(phone=phone, code=code, phone_code_hash=phone_code_hash)
         except SessionPasswordNeededError:
             pw = input("🔐 2FA password: ").strip()
             await client.sign_in(password=pw)

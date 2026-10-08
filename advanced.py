@@ -3924,7 +3924,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await reply_premium_message(msg, f"{pe('❌')} Format: <code>+919876543210</code>", parse_mode=ParseMode.HTML)
                 return
             try:
-                lc = await user_account.start_login(phone)
+                lc, phone_code_hash = await user_account.start_login(phone)
             except Exception as ex:
                 if 'CAPTCHA' in str(ex).upper():
                     await reply_premium_message(msg, f"{pe('🛡')} Telegram ne is VM ke IP par captcha laga diya hai - OTP VM se nahi ja sakta.\n\n{pe('✅')} Fix: phone (Termux) ya PC par make_session.py chalao, wahan phone + OTP do, SESSION STRING yahin STEP 3 me paste karo.\n\n{pe('🔁')} Ya phone dobara bhejo.", parse_mode=ParseMode.HTML)
@@ -3933,6 +3933,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             wz["client"] = lc
             wz["phone"] = phone
+            wz["phone_code_hash"] = phone_code_hash
             wz["step"] = "ask_code"
             await reply_premium_message(msg,
                 f"<blockquote>{pp('🔐')} <b>ADD USERBOT - STEP 4/4</b></blockquote>\n\n"
@@ -3951,7 +3952,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not code.isdigit():
                 await reply_premium_message(msg, f"{pe('❌')} OTP sirf digits hote hain.", parse_mode=ParseMode.HTML)
                 return
-            session_str, need_2fa, err = await user_account.complete_login(lc, wz["phone"], code)
+            session_str, need_2fa, err = await user_account.complete_login(
+                lc, wz["phone"], code, wz.get("phone_code_hash"))
             if err:
                 await reply_premium_message(msg, f"{pe('❌')} {err}", parse_mode=ParseMode.HTML)
                 return
