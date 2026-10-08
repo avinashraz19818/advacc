@@ -172,13 +172,21 @@ class UserAccountSender:
     async def start_login(self, phone: str):
         client = TelegramClient(StringSession(), API_ID, API_HASH)
         await client.connect()
-        await client.send_code_request(phone)
-        return client
+        sent_code = await client.send_code_request(phone)
+        # phone_code_hash ko explicitly capture karo — Telethon internally pop()
+        # karta hai sign_in mein, isliye pehli failed attempt ke baad hash gayab
+        # ho jaata hai aur agle attempt par PhoneCodeExpiredError aata hai.
+        phone_code_hash = sent_code.phone_code_hash
+        return client, phone_code_hash
 
-    async def complete_login(self, client, phone, code):
+    async def complete_login(self, client, phone, code, phone_code_hash=None):
         """Return (session_str|None, need_2fa: bool, error|None)."""
         try:
-            await client.sign_in(phone=phone, code=code)
+            # Explicit phone_code_hash pass karo taaki retry par bhi kaam kare
+            sign_kwargs = {}
+            if phone_code_hash:
+                sign_kwargs['phone_code_hash'] = phone_code_hash
+            await client.sign_in(phone=phone, code=code, **sign_kwargs)
         except SessionPasswordNeededError:
             return None, True, None
         except PhoneCodeInvalidError:
